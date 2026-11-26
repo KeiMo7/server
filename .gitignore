@@ -7,7 +7,6 @@ tmp
 *.log
 *.xml
 test_results.txt
-artifacts
 cprofile
 *.prof
 .venv

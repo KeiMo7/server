@@ -139,6 +139,9 @@ struct TritonServerParameters {
   // Custom model configuration file. Fall back to default config.pbtxt if not
   // set.
   std::string model_config_name_;
+  // Pre-flight repository policy check: fail startup on unparsable
+  // version_policy, empty candidate sets or unsatisfied specific policies.
+  bool strict_version_policy_{false};
 
   // Rate limiter configuration
   // FIXME: Once the rate limiter implementation is complete make

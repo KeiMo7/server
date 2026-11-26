@@ -358,6 +358,7 @@ enum TritonOptionId {
   OPTION_POLL_REPO_SECS,
   OPTION_STARTUP_MODEL,
   OPTION_CUSTOM_MODEL_CONFIG_NAME,
+  OPTION_STRICT_VERSION_POLICY,
   OPTION_RATE_LIMIT,
   OPTION_RATE_LIMIT_RESOURCE,
   OPTION_PINNED_MEMORY_POOL_BYTE_SIZE,
@@ -453,6 +454,16 @@ TritonParser::SetupOptions()
        "For example: --model-config-name=h100. "
        "If --model-config-name is not set, Triton will use the default "
        "config.pbtxt."});
+  model_repo_options_.push_back(
+      {OPTION_STRICT_VERSION_POLICY, "strict-version-policy",
+       Option::ArgBool,
+       "If true, fail startup when a model's version_policy cannot be "
+       "parsed, a model has no candidate version directories, or a "
+       "specific policy requests versions absent from disk. The check "
+       "runs as a pre-flight scan before the server is created and does "
+       "not change any runtime model-control semantics. Default is "
+       "false. This flag takes precedence over --exit-on-error for the "
+       "pre-flight check."});
   model_repo_options_.push_back(
       {OPTION_MODEL_LOAD_THREAD_COUNT, "model-load-thread-count",
        Option::ArgInt,
@@ -1674,6 +1685,9 @@ TritonParser::Parse(int argc, char** argv)
                 "Error: empty argument for --model-config-name");
           }
           lparams.model_config_name_ = optarg;
+          break;
+        case OPTION_STRICT_VERSION_POLICY:
+          lparams.strict_version_policy_ = ParseOption<bool>(optarg);
           break;
         case OPTION_MODEL_CONTROL_MODE: {
           std::string mode_str(optarg);

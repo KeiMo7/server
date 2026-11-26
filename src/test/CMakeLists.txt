@@ -32,6 +32,55 @@ cmake_minimum_required (VERSION 3.31.8)
 find_package(GTest REQUIRED)
 
 #
+# Unit test for the backend-independent repository policy module. It
+# depends only on the standard library and the module under test (no
+# network, GPU, backend or model files), so it is always built.
+#
+add_executable(
+  repository_policy_test
+  repository_policy_test.cc
+  ../repository_policy_parse.cc
+  ../repository_policy_engine.cc
+  ../repository_policy_scan.cc
+  ../repository_policy.h
+  ../repository_policy_detail.h
+  ../repository_policy_scan.h
+)
+
+set_target_properties(
+  repository_policy_test
+  PROPERTIES
+    SKIP_BUILD_RPATH TRUE
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH_USE_LINK_PATH FALSE
+    INSTALL_RPATH ""
+)
+
+target_include_directories(
+  repository_policy_test
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${GTEST_INCLUDE_DIRS}
+)
+
+target_link_libraries(
+  repository_policy_test
+  PRIVATE
+    GTest::gtest
+    GTest::gtest_main
+)
+
+install(
+  TARGETS repository_policy_test
+  RUNTIME DESTINATION bin
+)
+
+add_test(
+  NAME repository_policy_test
+  COMMAND repository_policy_test
+)
+
+#
 # Unit test for DataCompressor
 #
 if(${TRITON_ENABLE_HTTP} OR ${TRITON_ENABLE_METRICS} OR

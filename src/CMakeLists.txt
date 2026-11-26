@@ -110,10 +110,16 @@ add_executable(
   command_line_parser.cc
   common.cc
   main.cc
+  repository_policy_parse.cc
+  repository_policy_engine.cc
+  repository_policy_scan.cc
   shared_memory_manager.cc
   triton_signal.cc
   classification.h
   common.h
+  repository_policy.h
+  repository_policy_detail.h
+  repository_policy_scan.h
   shared_memory_manager.h
   triton_signal.h
 )
@@ -607,6 +613,50 @@ install(
 )
 
 #
+# repository_policy_check: backend-independent offline repository
+# policy checker. Links only the repository policy module, the standard
+# library and nlohmann_json; it never includes tritonserver.h.
+#
+add_executable(
+  repository_policy_check
+  repository_policy_check.cc
+  repository_policy_parse.cc
+  repository_policy_engine.cc
+  repository_policy_scan.cc
+)
+
+target_compile_features(
+  repository_policy_check PRIVATE cxx_std_${TRITON_MIN_CXX_STANDARD}
+)
+target_compile_options(
+  repository_policy_check
+  PRIVATE
+    -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations -Werror
+)
+
+set_target_properties(
+  repository_policy_check
+  PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    SKIP_BUILD_RPATH TRUE
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH_USE_LINK_PATH FALSE
+    INSTALL_RPATH ""
+)
+
+find_package(nlohmann_json CONFIG REQUIRED)
+target_link_libraries(
+  repository_policy_check
+  PRIVATE
+    nlohmann_json::nlohmann_json
+)
+
+install(
+  TARGETS repository_policy_check
+  RUNTIME DESTINATION bin
+)
+
+#
 # multi_server example
 #
 add_executable(
@@ -710,5 +760,6 @@ endif() # TRITON_ENABLE_GPU
 # tritonfrontend python package
 add_subdirectory(python)
 
+enable_testing()
 add_subdirectory(test test)
 

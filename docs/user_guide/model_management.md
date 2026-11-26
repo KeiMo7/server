@@ -142,6 +142,58 @@ In `POLL` mode Triton responds to the following model repository changes:
 - Label(s) files providing labels for outputs that represent classifications can be added, removed, or modified and Triton will unload and reload the model to pick up the new labels.
   If a label file is added or removed, the corresponding edit to the `label_filename` property of the output it corresponds to in the [model configuration](model_configuration.md) must be performed at the same time.
 
+### Repository Policy Reconciliation
+
+In addition to the polling performed by the server core, Triton runs a
+backend-independent repository policy layer that decides which versions
+*should* be served from the on-disk repository, reconciles that
+expectation with the versions actually reported by the model index, and
+emits bounded, deterministic reconciliation events. The layer never
+loads or unloads a model itself; it only produces expectations and
+events, while `TRITONSERVER_ServerPollModelRepository` remains the
+component that performs the load and unload actions.
+
+- **Two-round stability.** A configuration file or a version directory
+  whose fingerprint changes is held as *pending* for one poll interval.
+  The new content only takes effect when two consecutive scans report
+  the same fingerprint, which avoids acting on a repository that is
+  being written halfway. If the fingerprint keeps changing across
+  rounds, the repository is flagged `unstable_repository` and the last
+  confirmed content continues to be used. Version directory fingerprints
+  are derived only from the regular file count, total byte size and the
+  greatest modification time; model file contents are never read.
+
+- **expected_missing.** When a `specific` version policy lists versions
+  that have no candidate directory on disk, those versions are reported
+  in `expected_missing`. They are not treated as errors on their own;
+  the model simply serves the intersection of the requested and the
+  available versions. A `specific` policy whose requested versions are
+  all absent leaves the model with no available versions.
+
+- **draining.** When a version disappears from disk but the model index
+  still reports it (for example, while in-flight requests complete), the
+  version enters the `draining` set and is tracked as `UNLOADING` rather
+  than being erased. It remains observable until the index releases it;
+  if it stays beyond the drain grace interval the condition is logged as
+  a warning only, so a stuck drain is visible without being escalated to
+  an error.
+
+- **DecidePoll and the forced-poll floor.** The policy layer can skip a
+  call to `TRITONSERVER_ServerPollModelRepository` on an interval when
+  no on-disk change signature is pending, reducing the number of full
+  repository scans while the repository is idle. A forced-poll interval
+  caps how long polling may be suppressed: a full poll is always
+  performed at least once within that number of intervals even if no
+  change was detected, and after repeated index fetch failures, so a
+  change that did not surface through a fingerprint can never be missed
+  indefinitely. The final model state is identical to polling on every
+  interval.
+
+The version directory naming rules this layer uses are unchanged from
+the [model repository](model_repository.md#model-versions)
+conventions: only pure, non-zero decimal directory names without leading
+zeros are candidate versions.
+
 ## Modifying the Model Repository
 
 Each model in a model repository [resides in its own sub-directory](model_repository.md#repository-layout).

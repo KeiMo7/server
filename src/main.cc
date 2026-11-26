@@ -42,10 +42,18 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <memory>
+#include <set>
 #include <sstream>
+#include <string>
 #include <thread>
+#include <vector>
+
+#include <nlohmann/json.hpp>
 
 #include "triton_signal.h"
 
@@ -55,6 +63,8 @@
 
 #include "command_line_parser.h"
 #include "common.h"
+#include "repository_policy.h"
+#include "repository_policy_scan.h"
 #include "shared_memory_manager.h"
 #include "tracer.h"
 #include "triton/common/logging.h"
@@ -459,6 +469,173 @@ StopTracing(triton::server::TraceManager** trace_manager)
   return true;
 }
 
+namespace repo = triton::server::repository;
+
+// Convert the server's /v2/repository/index JSON message into the
+// backend-neutral IndexSnapshot the policy module consumes. This is the
+// single place in the server that knows about the index wire format.
+bool
+BuildIndexSnapshot(
+    const char* buffer, size_t byte_size, repo::IndexSnapshot* snapshot,
+    std::string* error)
+{
+  try {
+    nlohmann::json parsed = nlohmann::json::parse(buffer, buffer + byte_size);
+    if (!parsed.is_array()) {
+      *error = "repository index JSON is not an array";
+      return false;
+    }
+    for (const auto& row : parsed) {
+      repo::IndexEntry entry;
+      entry.name = row.value("name", "");
+      entry.state = row.value("state", "");
+      entry.reason = row.value("reason", "");
+      if (row.contains("version") && !row["version"].is_null() &&
+          row["version"].is_string()) {
+        const std::string version_text = row["version"].get<std::string>();
+        if (!version_text.empty()) {
+          try {
+            entry.version = std::stoull(version_text);
+          }
+          catch (...) {
+            entry.version.reset();
+          }
+        }
+      }
+      snapshot->entries.push_back(std::move(entry));
+    }
+  }
+  catch (const std::exception& e) {
+    *error = std::string("failed to parse repository index JSON: ") + e.what();
+    return false;
+  }
+  return true;
+}
+
+// Fetch the live index through libtritonserver and convert it. Returns
+// false (without raising policy drift) on any failure.
+bool
+FetchIndexSnapshot(TRITONSERVER_Server* server, repo::IndexSnapshot* snapshot)
+{
+  TRITONSERVER_Message* message = nullptr;
+  TRITONSERVER_Error* err =
+      TRITONSERVER_ServerModelIndex(server, 0 /* all states */, &message);
+  if (err != nullptr) {
+    LOG_TRITONSERVER_ERROR(err, "failed to read repository index");
+    return false;
+  }
+  const char* buffer = nullptr;
+  size_t byte_size = 0;
+  err = TRITONSERVER_MessageSerializeToJson(message, &buffer, &byte_size);
+  if (err != nullptr) {
+    LOG_TRITONSERVER_ERROR(err, "failed to serialize repository index");
+    TRITONSERVER_MessageDelete(message);
+    return false;
+  }
+  std::string parse_error;
+  bool ok = BuildIndexSnapshot(buffer, byte_size, snapshot, &parse_error);
+  if (!ok) {
+    LOG_WARNING << parse_error;
+  }
+  TRITONSERVER_MessageDelete(message);
+  return ok;
+}
+
+// Pre-flight repository scan performed before TRITONSERVER_ServerNew.
+// Cloud-backed repositories are skipped with a warning; local paths are
+// scanned and every model gets one I-level summary line. In strict mode
+// any configuration parse failure, empty candidate set or unsatisfied
+// specific policy aborts startup with exit(1).
+bool
+PreflightRepositoryPolicy(
+    const std::set<std::string>& repository_paths,
+    const std::string& model_config_name, bool strict)
+{
+  auto policy_engine =
+      std::make_unique<repo::RepositoryPolicyEngine>(model_config_name);
+  bool strict_failure = false;
+  uint64_t scan_seq = 0;
+  std::vector<std::string> local_roots;
+
+  for (const auto& path : repository_paths) {
+    if (repo::IsCloudRepositoryPath(path)) {
+      LOG_WARNING << "repo-policy: model=- version=- from=UNKNOWN to=UNKNOWN "
+                  "severity=warn reason=cloud_repository_skipped path="
+               << path;
+      continue;
+    }
+    local_roots.push_back(path);
+  }
+
+  repo::RepositoryScan scan;
+  repo::Status status = repo::ScanRepositories(
+      local_roots, model_config_name, ++scan_seq, &scan);
+  if (!status.ok) {
+    if (strict) {
+      LOG_ERROR << "repo-policy: model=- version=- from=UNKNOWN to=UNKNOWN "
+                   "severity=error reason="
+                << status.message;
+      return false;
+    }
+    LOG_WARNING << "repo-policy: model=- version=- from=UNKNOWN to=UNKNOWN "
+                "severity=warn reason="
+             << status.message;
+    return true;
+  }
+
+  // No live index exists before the server is created.
+  policy_engine->Observe(scan, std::nullopt, 0);
+
+  for (const repo::ModelScan& model : scan.models) {
+    repo::VersionPolicy policy;
+    repo::Status parse_status = repo::Status::OK();
+    if (model.config_present) {
+      parse_status = repo::ParseVersionPolicy(model.config_text, &policy);
+    }
+    std::vector<uint64_t> missing;
+    std::vector<uint64_t> expected =
+        repo::ApplyVersionPolicy(policy, model.versions, &missing);
+
+    LOG_INFO << "repo-policy: model=" << model.name
+             << " versions_on_disk=" << model.versions.size()
+             << " expected_served=" << expected.size()
+             << " expected_missing=" << missing.size()
+             << " config_present=" << (model.config_present ? 1 : 0)
+             << " strict=" << (strict ? 1 : 0);
+
+    if (!parse_status.ok) {
+      strict_failure = true;
+      LOG_ERROR << "repo-policy: model=" << model.name
+                << " version=- from=UNKNOWN to=UNAVAILABLE severity=error "
+                   "reason="
+                << parse_status.message;
+    }
+    if (model.versions.empty()) {
+      strict_failure = true;
+      LOG_ERROR << "repo-policy: model=" << model.name
+                << " version=- from=UNKNOWN to=UNAVAILABLE severity=error "
+                   "reason=no_available_versions";
+    }
+    if (!missing.empty()) {
+      strict_failure = true;
+      std::ostringstream oss;
+      oss << "expected_missing";
+      for (uint64_t v : missing) {
+        oss << ":" << v;
+      }
+      LOG_ERROR << "repo-policy: model=" << model.name
+                << " version=- from=UNKNOWN to=UNAVAILABLE severity=error "
+                   "reason="
+                << oss.str();
+    }
+  }
+
+  if (strict && strict_failure) {
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 int
@@ -510,6 +687,27 @@ main(int argc, char** argv)
   auto shm_manager = std::make_shared<triton::server::SharedMemoryManager>(
       g_triton_params.allow_client_shm_);
 
+  // Backend-independent pre-flight repository policy check. Runs before
+  // the server is created and only reads the local filesystem. In strict
+  // mode a policy failure ends the process here; --strict-version-policy
+  // takes precedence over --exit-on-error for this check only.
+  if (!PreflightRepositoryPolicy(
+          g_triton_params.model_repository_paths_,
+          g_triton_params.model_config_name_,
+          g_triton_params.strict_version_policy_)) {
+    LOG_ERROR << "strict version policy pre-flight check failed";
+    exit(1);
+  }
+
+  // Policy reconciliation engine for the poll loop. It only produces
+  // expectations and events; all loading/unloading stays with
+  // libtritonserver.
+  auto policy_engine = std::make_unique<repo::RepositoryPolicyEngine>(
+      g_triton_params.model_config_name_);
+  uint64_t policy_scan_seq = 0;
+  uint32_t policy_poll_index = 0;
+  uint64_t last_logged_event_seq = 0;
+
   // Create the server...
   TRITONSERVER_Server* server_ptr = nullptr;
   FAIL_IF_ERR(
@@ -539,11 +737,63 @@ main(int argc, char** argv)
   // Wait until a signal terminates the server...
   while (!triton::server::signal_exiting_) {
     // If enabled, poll the model repository to see if there have been
-    // any changes.
+    // any changes. DecidePoll() suppresses redundant polls when nothing
+    // on disk changed but always forces one at the interval cap, so a
+    // missed change can never persist.
     if (g_triton_params.repository_poll_secs_ > 0) {
-      LOG_TRITONSERVER_ERROR(
-          TRITONSERVER_ServerPollModelRepository(server_ptr),
-          "failed to poll model repository");
+      if (policy_engine->DecidePoll(policy_poll_index)) {
+        LOG_TRITONSERVER_ERROR(
+            TRITONSERVER_ServerPollModelRepository(server_ptr),
+            "failed to poll model repository");
+
+        // Re-scan the disk side and reconcile with the fresh index.
+        std::vector<std::string> local_roots;
+        for (const auto& path : g_triton_params.model_repository_paths_) {
+          if (!repo::IsCloudRepositoryPath(path)) {
+            local_roots.push_back(path);
+          }
+        }
+        repo::RepositoryScan disk_scan;
+        repo::Status scan_status = repo::ScanRepositories(
+            local_roots, g_triton_params.model_config_name_,
+            ++policy_scan_seq, &disk_scan);
+        if (!scan_status.ok) {
+          policy_engine->ObserveScanFailure(
+              scan_status, policy_poll_index,
+              local_roots.empty() ? std::string() : local_roots.front());
+        } else {
+          repo::IndexSnapshot index_snapshot;
+          if (FetchIndexSnapshot(server_ptr, &index_snapshot)) {
+            policy_engine->Observe(
+                disk_scan, std::move(index_snapshot), policy_poll_index);
+          } else {
+            // Index failure: refresh disk expectations only; the engine
+            // records a Warn and never advances version state.
+            policy_engine->Observe(
+                disk_scan, std::nullopt, policy_poll_index);
+          }
+        }
+
+        // Emit only the events produced since the previous poll; the
+        // engine's ring retains history but the log must not repeat it.
+        for (const auto& event : policy_engine->Events()) {
+          if (event.seq <= last_logged_event_seq) {
+            continue;
+          }
+          last_logged_event_seq = event.seq;
+          const std::string line = repo::FormatEventLine(event);
+          if (event.severity == repo::DriftSeverity::Error) {
+            LOG_ERROR << line;
+          } else if (event.severity == repo::DriftSeverity::Warn) {
+            LOG_WARNING << line;
+          } else {
+            LOG_INFO << line;
+          }
+        }
+      } else {
+        policy_engine->NoteSkippedPoll();
+      }
+      ++policy_poll_index;
     }
 
     // Wait for the polling interval (or a long time if polling is not
